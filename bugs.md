@@ -1,117 +1,68 @@
 # Security Review Report (Bug Bounty Focus)
 
-Date: 2026-05-08
-Repository: `onlybugs05/langchain`
-Scope: Targeted source review for high-impact vulnerabilities (RCE, unauthorized access, SSRF/path traversal, secrets exposure)
+Date: 2026-05-09  
+Repository: `onlybugs05/langchain`  
+Scope: Security review of filesystem-boundary and prompt-loading code paths for high-impact issues (unauthorized access, sensitive data exposure, and exploit chains that can enable account takeover).
 
-## Executive summary
+## Executive Summary
 
-I reviewed security-sensitive areas of the repository, with emphasis on:
-- command execution surfaces,
-- filesystem boundary enforcement,
-- SSRF protections,
-- unsafe deserialization and dangerous defaults.
+I reviewed high-risk surfaces in the current codebase and identified two new filesystem-boundary bypasses that can violate security assumptions in “restricted path” modes:
 
-### Top outcomes
-1. **Potential arbitrary local file read despite `allow_dangerous_paths=False`** in prompt example loading via symlink confusion.
-2. **High-risk host command execution posture** when `ShellToolMiddleware` is used with default `HostExecutionPolicy` in untrusted-input deployments.
-3. **Regex-based DoS risk** in `FilesystemFileSearchMiddleware` Python grep fallback.
+1. `FilesystemFileSearchMiddleware.glob_search` allows root escape using crafted glob patterns and symlink dereferencing.
+2. Prompt loading with `allow_dangerous_paths=False` still permits symlink-based escape for `template_path` and `example_prompt_path` (distinct from the excluded known issue involving `examples`).
 
----
+Both findings can expose sensitive local files and configuration data and may lead to credential theft in real deployments.
 
 ## Findings
 
-## 1) Path restriction bypass in prompt loading (`allow_dangerous_paths=False`) via symlinked examples file
+### 1) Root-path escape in `FilesystemFileSearchMiddleware.glob_search` via unvalidated glob pattern
 
-- **Severity:** High
-- **Category:** Path traversal / unauthorized local file read
-- **Impact:** Confidential file disclosure (e.g., credentials, API keys, environment-derived secrets) when untrusted prompt configs are accepted.
+- **Severity:** High  
+- **Category:** Path traversal / unauthorized filesystem access  
+- **Impact:** An attacker controlling tool inputs can enumerate files outside the configured `root_path`, breaking sandbox expectations and potentially discovering sensitive targets (keys/config files) for follow-on abuse.
 
-### Affected code
+**Affected code**
+- `/home/runner/work/langchain/langchain/libs/langchain_v1/langchain/agents/middleware/file_search.py:160-166`
+- `/home/runner/work/langchain/langchain/libs/langchain_v1/langchain/agents/middleware/file_search.py:235-257`
+
+**Exploit sketch**
+1. Application exposes `glob_search` to untrusted model/user input with `root_path` intended as confinement.
+2. Attacker supplies `pattern="../../etc/passwd"` (or `../**/*`) with default `path="/"`.
+3. `base_full.glob(pattern)` yields matches outside root.
+4. Code returns escaped virtual paths like `/../../etc/passwd`, confirming access outside sandbox.
+
+**Recommended fix**
+- Validate `pattern` and reject traversal tokens and absolute-like patterns before calling `glob`.
+- Resolve each candidate (`match.resolve()`) and enforce `resolved.relative_to(self.root_path)` before accepting.
+- Consider hard-failing on any match that escapes root, not just dropping it silently.
+
+---
+
+### 2) Symlink-based path restriction bypass in prompt loading for `template_path` and `example_prompt_path` when `allow_dangerous_paths=False`
+
+- **Severity:** High  
+- **Category:** Path restriction bypass / unauthorized local file read  
+- **Impact:** Attackers who can influence prompt config + local symlink placement can load prompt data from outside intended safe paths, exposing secrets stored in local text/JSON/YAML files.
+
+**Affected code**
 - `/home/runner/work/langchain/langchain/libs/core/langchain_core/prompts/loading.py:21-45` (`_validate_path`)
-- `/home/runner/work/langchain/langchain/libs/core/langchain_core/prompts/loading.py:112-129` (`_load_examples`)
+- `/home/runner/work/langchain/langchain/libs/core/langchain_core/prompts/loading.py:85-109` (`_load_template`)
+- `/home/runner/work/langchain/langchain/libs/core/langchain_core/prompts/loading.py:157-173` (`_load_few_shot_prompt`, `example_prompt_path` flow)
+- `/home/runner/work/langchain/langchain/libs/core/langchain_core/prompts/loading.py:245-265` (`_load_prompt_from_file`)
 
-### Why this is vulnerable
-`_validate_path` only rejects absolute paths and `..` traversal tokens. In `_load_examples`, the code then opens `Path(config["examples"])` directly and checks extension from the **symlink path name**, not the resolved target:
-- validation does **not** reject relative symlinks,
-- extension checks are performed on `path.suffix`, not `path.resolve().suffix`.
+**Exploit sketch**
+1. Attacker provides config with relative `template_path` or `example_prompt_path` that passes `_validate_path` (no absolute path, no `..`).
+2. Path is a symlink to a file outside the trusted directory boundary.
+3. Loader resolves/follows symlink and reads/parses target file.
+4. Protected mode (`allow_dangerous_paths=False`) is bypassed for these fields.
 
-An attacker who can influence config and filesystem contents can provide a benign-looking relative path (e.g., `examples.yaml`) that is a symlink to a sensitive file outside the intended directory.
+**Recommended fix**
+- In restricted mode, reject symlinks for all file path fields (`template_path`, `example_prompt_path`, and nested loads), or strictly enforce resolved path containment against an explicit trusted base.
+- Apply path policy to resolved targets, not only the original user-supplied path string.
+- Add regression tests specifically for symlink escapes on `template_path` and `example_prompt_path`.
 
-### Exploit sketch
-1. Place/target a symlink named `examples.yaml` in working directory.
-2. Point it to a sensitive file readable by the process.
-3. Submit prompt config with `"examples": "examples.yaml"` and rely on default `allow_dangerous_paths=False`.
-4. Loader opens and parses target content, violating path-safety expectation.
+## Suggested Prioritization
 
-### Recommended fix
-- Resolve paths before use and enforce policy on resolved target:
-  - apply `resolved = path.resolve(strict=True)` in `_load_examples`,
-  - validate resolved path against an explicit trusted base directory,
-  - perform suffix/type checks on `resolved`, not the symlink name.
-- Consider rejecting symlinks entirely for untrusted mode.
-
----
-
-## 2) RCE-prone default execution posture for `ShellToolMiddleware`
-
-- **Severity:** High (deployment-dependent)
-- **Category:** Remote code execution / privilege misuse
-- **Impact:** If exposed to untrusted prompts or prompt-injected tool calls, agent can execute arbitrary host commands with process privileges.
-
-### Affected code
-- `/home/runner/work/langchain/langchain/libs/langchain_v1/langchain/agents/middleware/shell_tool.py:503-566`
-- `/home/runner/work/langchain/langchain/libs/langchain_v1/langchain/agents/middleware/_execution.py:92-105`
-
-### Why this is risky
-`ShellToolMiddleware` defaults to `HostExecutionPolicy` when no policy is supplied. `HostExecutionPolicy` explicitly provides no filesystem/network sandboxing and runs commands as the host process user.
-
-This creates a high-impact RCE surface in common agent deployments where model outputs can trigger tool use (including via prompt injection from external content).
-
-### Exploit sketch
-1. App integrates agent with `ShellToolMiddleware()` default settings.
-2. Untrusted user content/prompt injection coerces tool invocation.
-3. Model emits shell command exfiltrating data or modifying host state.
-4. Command executes directly on host environment.
-
-### Recommended fix
-- Fail closed by default for untrusted contexts:
-  - require explicit policy selection instead of defaulting to host execution, or
-  - default to stronger isolation policy (`DockerExecutionPolicy` / sandbox) where available.
-- Add an explicit `dangerously_allow_host_execution=True` style opt-in guard with prominent runtime warning.
-
----
-
-## 3) Potential ReDoS in `FilesystemFileSearchMiddleware` grep fallback
-
-- **Severity:** Medium
-- **Category:** Denial of service (CPU exhaustion)
-- **Impact:** Crafted regex can trigger catastrophic backtracking when Python fallback search is used, causing prolonged CPU use and degraded service.
-
-### Affected code
-- `/home/runner/work/langchain/langchain/libs/langchain_v1/langchain/agents/middleware/file_search.py:312-353`
-- `/home/runner/work/langchain/langchain/libs/langchain_v1/langchain/agents/middleware/file_search.py:202-207`
-
-### Why this is risky
-User-controlled regex is compiled and executed across file lines in Python (`regex.search(line)`), without complexity safeguards or timeout. Malicious patterns can cause expensive matching behavior.
-
-### Recommended fix
-- Prefer ripgrep-only execution with strict timeout where possible.
-- For Python fallback, enforce:
-  - regex complexity constraints,
-  - per-match/per-file time budgets,
-  - line length and total scanned-bytes ceilings,
-  - optional RE2-based engine for untrusted patterns.
-
----
-
-## Additional notes
-
-- SSRF controls in `langchain_core._security._ssrf_protection` appear intentionally defensive (scheme restrictions, private/cloud metadata blocking, DNS/IP checks).
-- Deserialization (`langchain_core.load.load`) clearly documents trust-boundary risks and warns defaults are unsafe for untrusted manifests; this is important and should remain highly visible in user-facing docs.
-
-## Suggested prioritization
-
-1. Fix finding #1 first (direct unauthorized file-read risk despite safety flag semantics).
-2. Harden default posture for shell execution integrations (#2).
-3. Add ReDoS controls in file-search fallback (#3).
+1. **P0:** Fix `glob_search` root-escape and symlink dereference behavior in `FilesystemFileSearchMiddleware` (immediately user-reachable in agent tool execution paths).
+2. **P0/P1:** Close prompt-loading symlink bypasses for `template_path` and `example_prompt_path` under `allow_dangerous_paths=False`.
+3. **P1:** Add cross-module path-safety invariants and shared helper coverage (resolve + containment checks + symlink policy) to prevent similar regressions.
